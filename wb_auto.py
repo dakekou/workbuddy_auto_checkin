@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书。
+"""wb_auto.py —— 云端 runner / 青龙面板执行的每日自动化：签到 + 猫猫旅行 + 每日对话，结果推飞书。
 
 设计要点：
-  1. 一次运行把签到与派猫都做掉；
-  2. 先领已到家的旅行积分，再判断能否派新一趟；今日名额已用则不派；
-  3. 签到与猫猫状态分开汇报；
-  4. 猫猫失败不污染签到结论 —— 签到成功即整体成功。
-
-凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
+1. 一次运行把签到、派猫与每日对话都做掉；
+2. 先领已到家的旅行积分，再判断能否派新一趟；今日名额已用则不派；
+3. 自动发送一条极简问候对话，确保触发每日有效活跃条件；
+4. 签到、猫猫与对话状态分开汇报，子模块失败不污染签到结论 —— 签到成功即整体成功。
 """
 
 import json
@@ -18,9 +16,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 25
 MAX_RETRY = 3
 
 CODE_NO_NETWORK = -1
@@ -88,20 +87,16 @@ def request(url, headers, method="GET", payload=None, retry=True):
                 body = json.loads(raw)
             except ValueError:
                 body = {"raw": raw[:300]}
-            # 偶发 3xx（快速轮询时网关会短暂跳转）不是业务结论，退避后重试
             if 300 <= e.code < 400 and attempt < MAX_RETRY:
                 log("  · 收到 %d 跳转，%.1fs 后重试（%d/%d）"
                     % (e.code, 2.0 * attempt, attempt, MAX_RETRY))
-                import time
                 time.sleep(2.0 * attempt)
                 continue
             return e.code, body
         except Exception as e:
-            # 只对网络抖动与 5xx 重试；写操作靠接口幂等，最多重试一次
             if not retry or attempt >= MAX_RETRY:
                 return CODE_NO_NETWORK, {"error": "%s: %s" % (type(e).__name__, e)}
             log("  · 请求异常，%.1fs 后重试（%d/%d）" % (2.0, attempt, MAX_RETRY))
-            import time
             time.sleep(2.0)
 
 
@@ -187,7 +182,6 @@ def _already_checked_in(code, body):
 
 
 def _fmt_eta(arrive_at, server_now):
-    """把秒级时间戳差格式化成人类可读文案；数据缺失时不编造。"""
     if arrive_at is None or server_now is None:
         return ""
     try:
@@ -277,14 +271,12 @@ def run_buddy(headers, endpoint):
                 notes.append("已派猫猫去%s%s" % (name, "（约 %s 小时后回）" % dur if dur else ""))
                 return {"result": "DEPARTED", "notes": notes, "report": "；".join(notes)}
             msg = dig(unwrap(dbody), "msg") or dig(dbody, "msg") or ""
-            # 名额已用完属于正常幂等结果，不算失败
             if "limit" in str(msg).lower() or dcode == 429:
                 notes.append("今日旅行名额已用完，不再派出")
                 return {"result": "LIMIT_REACHED", "notes": notes, "report": "；".join(notes)}
             return {"result": "ERROR",
                     "report": "派出失败：%s（HTTP %s）" % (msg or "未知", dcode), "notes": notes}
 
-        # 兜底：state 不是已知取值。原样汇报、不做写操作，避免误派或误领。
         return {"result": "UNKNOWN_STATE",
                 "report": "；".join(notes) if notes else "未识别的旅行状态：%s" % raw_state,
                 "notes": notes}
@@ -292,17 +284,64 @@ def run_buddy(headers, endpoint):
         return {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e), "notes": notes}
 
 
+# ---------------------------------------------------------------- 每日对话问候
+
+def run_chat(headers, endpoint):
+    """发送一条极简问候消息（hi），保证每天触发一次有效对话使用记录。"""
+    session_id = str(uuid.uuid4())
+    # 支持通过环境变量 WB_CHAT_MSG 自定义发送内容，默认发送 "hi"
+    msg_content = os.environ.get("WB_CHAT_MSG") or "hi"
+
+    # 兼容不同版本的对话接口路径（按优先级依次尝试）
+    candidates = [
+        (
+            endpoint + "/v2/chat/completions",
+            {
+                "session_id": session_id,
+                "messages": [{"role": "user", "content": msg_content}],
+                "stream": False,
+            },
+        ),
+        (
+            endpoint + "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": msg_content}],
+                "stream": False,
+            },
+        ),
+    ]
+
+    last_err = "未知错误"
+    for url, payload in candidates:
+        ccode, cbody = post(url, headers, payload)
+        log("  [对话-%s] HTTP %s %s" % (
+            url.split(endpoint)[-1],
+            ccode,
+            json.dumps(masked(cbody), ensure_ascii=False)
+        ))
+
+        if ccode == CODE_NO_NETWORK:
+            last_err = "网络不可达"
+            continue
+        if ccode in (401, 403):
+            return {"result": "AUTH", "report": "对话认证被拒（HTTP %s）" % ccode}
+        if 200 <= ccode < 300:
+            return {"result": "SENT", "report": "已发送问候（\"%s\"），每日对话已激活" % msg_content}
+        if ccode == 404:
+            # 路径不匹配则自动尝试下一个候选路径
+            last_err = "接口路径不存在（HTTP 404）"
+            continue
+
+        msg = dig(unwrap(cbody), "msg") or dig(cbody, "msg") or dig(cbody, "error", "message") or ""
+        last_err = "HTTP %s%s" % (ccode, "（%s）" % msg if msg else "")
+
+    return {"result": "ERROR", "report": "每日对话发送失败：%s" % last_err}
+
+
 # ---------------------------------------------------------------- 飞书
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
-    """推送到飞书自定义机器人。返回 (ok, reason)。
-
-    重试策略与业务请求、WPS 版保持一致：
-      - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），瞬时故障自愈
-      - 飞书业务拒绝（19001 地址无效、机器人开启签名校验等）→ 不重试（重试无用），
-        原因带改法返回，写入结果供 step summary 展示
-    兜底：脚本幂等，当天 cron 有多个时段时，下一次运行会自动再推一遍当天结果。
-    """
+def push_feishu(webhook, title, checkin_line, buddy_line, chat_line, overall_ok):
+    """推送到飞书自定义机器人。返回 (ok, reason)。"""
     color = "green" if overall_ok else "red"
     lines = [
         "**%s**" % title,
@@ -312,6 +351,9 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
         "",
         "**猫猫旅行**",
         buddy_line,
+        "",
+        "**每日对话**",
+        chat_line,
     ]
     payload = {
         "msg_type": "interactive",
@@ -377,37 +419,45 @@ def main():
         "User-Agent": "WorkBuddy",
     }
 
-    log("=== 1/2 签到 ===")
+    log("=== 1/3 签到 ===")
     checkin_ok, checkin = run_checkin(headers, endpoint)
     log("  结论：%s" % checkin["report"])
 
     # 猫猫独立 try：任何异常都不影响签到结论
-    log("=== 2/2 猫猫旅行 ===")
+    log("=== 2/3 猫猫旅行 ===")
     try:
         buddy = run_buddy(headers, endpoint)
     except Exception as e:
         buddy = {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e)}
     log("  结论：%s" % buddy.get("report", ""))
 
+    # 每日对话独立 try：发送极简问候触发每日活跃
+    log("=== 3/3 每日对话 ===")
+    try:
+        chat = run_chat(headers, endpoint)
+    except Exception as e:
+        chat = {"result": "ERROR", "report": "对话模块异常（%s: %s）" % (type(e).__name__, e)}
+    log("  结论：%s" % chat.get("report", ""))
+
     # 整体成败只看签到：签到成功即成功
     overall_ok = checkin_ok
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
+    chat_line = ("💬 " + chat.get("report", "")) if chat.get("report") else "💬 无结论"
 
-    # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
     push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
     if webhook:
-        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, chat_line, overall_ok)
 
     result = {
         "checkin": {"ok": checkin_ok, **checkin},
         "buddy": {k: v for k, v in buddy.items() if k != "notes"},
+        "chat": chat,
         "push": {"ok": push_ok, "reason": push_reason},
         "overall_ok": overall_ok,
     }
     print("RESULT_JSON " + json.dumps(result, ensure_ascii=False))
 
-    # 结果文件只含结论文案，不含 token，供 Actions 写入 step summary
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
@@ -417,6 +467,7 @@ def main():
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
+                f.write("| 每日对话 | %s |\n" % chat_line)
                 f.write("| 飞书推送 | %s |\n" % push_line)
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
